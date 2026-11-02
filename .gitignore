@@ -1,0 +1,6 @@
+vulndb/
+cvefixes/
+sonuclar.txt
+__pycache__/
+*.zip
+*.db
