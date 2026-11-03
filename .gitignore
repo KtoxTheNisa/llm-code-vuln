@@ -1,8 +1,6 @@
-vulndb/
+
 cvefixes/
 sonuclar.txt
 __pycache__/
 *.zip
 *.db
-eval_python.json
-sonuc_*.jsonl
