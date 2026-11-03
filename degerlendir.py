@@ -1,85 +1,117 @@
-import sys, re, json, os, chromadb, ollama
+import sys, re, json, os, csv
+from collections import defaultdict
+import numpy as np
+import chromadb, ollama
 
-split, n = sys.argv[1], int(sys.argv[2])
-db = chromadb.PersistentClient(path="vulndb")
-cwe_col = db.get_collection("cwe")
-kod_col = db.get_collection("cvefixes_kod")
+sys.stdout.reconfigure(encoding="utf-8")
+
+split = sys.argv[1] if len(sys.argv) > 1 else "test"
+tum = json.load(open("eval_python.json", encoding="utf-8"))
+kayitlar = [k for k in tum if k["split"] == split]
+if len(sys.argv) > 2:
+    kayitlar = kayitlar[:int(sys.argv[2])]
 CIKTI = f"sonuc_{split}.jsonl"
 
-def sor(prompt):
-    r = ollama.chat(model="qwen2.5-coder:7b",
-                    messages=[{"role": "user", "content": prompt}],
-                    options={"num_ctx": 8192, "temperature": 0})
+cwe_aciklama = {}
+for r in csv.DictReader(open("1000.csv", encoding="utf-8-sig")):
+    cwe_aciklama["CWE-" + r["CWE-ID"]] = f"{r['Name']}: {r['Description'][:180]}"
+
+col = chromadb.PersistentClient(path="vulndb").get_collection("cvefixes")
+veri = col.get(include=["embeddings", "documents", "metadatas"])
+M = np.array(veri["embeddings"], dtype=np.float32)
+M /= np.linalg.norm(M, axis=1, keepdims=True)
+
+
+def sor(prompt, max_tok=60):
+    r = ollama.chat(model="qwen2.5-coder:7b", messages=[{"role": "user", "content": prompt}],
+                    options={"num_ctx": 8192, "temperature": 0, "num_predict": max_tok})
     return r["message"]["content"]
 
+
 def embed(t):
-    return ollama.embed(model="nomic-embed-text", input=t)["embeddings"]
+    v = np.array(ollama.embed(model="nomic-embed-text", input=t[:3500])["embeddings"][0], dtype=np.float32)
+    return v / np.linalg.norm(v)
 
-FORMAT = """Answer format (strict):
-- If the code has no security weakness, answer exactly: NONE
-- Otherwise one line per weakness: CWE-<number>: <short reason>
-Report at most 3 weaknesses, and only ones actually present in the code."""
 
-def ozetle(kod):
-    return sor(f"""List the security weaknesses that are ACTUALLY PRESENT in this code, in English.
-Only mention what you can see in the code. Do not guess about things that are not there.
-One short sentence per weakness, no code. If there are none, say so.
+def ornekler(kod):
+    q = embed(kod)
+    skor = np.dot(M, q)
+    sirali = np.argsort(skor)[::-1]
 
-{kod}""")
+    # 1) Saf kNN (sadece vektör uzaklığı, farklı CVE'lerden ağırlıksız ilk 3 komşu)
+    knn, gorulen_cve = [], set()
+    for idx in sirali[1:]:
+        m = veri["metadatas"][idx]
+        if m["cve"] in gorulen_cve:
+            continue
+        gorulen_cve.add(m["cve"])
+        for cw in m["cwes"].split(","):
+            cw = cw.strip()
+            if cw and cw not in knn:
+                knn.append(cw)
+        if len(knn) >= 3:
+            break
 
-def cwe_baglam(ozet):
-    h = cwe_col.query(query_embeddings=embed(ozet), n_results=6)
-    return "\n---\n".join(d[:500] for d in h["documents"][0])
+    # 2) RAG + LLM için en yakın 3 örnek + CWE tanımları
+    oy = defaultdict(float)
+    for r_i, idx in enumerate(sirali[:5]):
+        ag = (float(max(skor[idx], 0.0)) ** 2) / (r_i + 1)
+        for cw in veri["metadatas"][idx]["cwes"].split(","):
+            cw = cw.strip()
+            if cw:
+                oy[cw] += ag
+    adaylar = [c for c, _ in sorted(oy.items(), key=lambda x: x[1], reverse=True)[:4]]
 
-def ornek_baglam(kod):
-    h = kod_col.query(query_embeddings=embed("search_document: " + kod), n_results=3)
     parcalar = []
-    for d, m in zip(h["documents"][0], h["metadatas"][0]):
-        parcalar.append(f"[Known vulnerable function, labeled {m['cwes']}]\n{d[:800]}")
-    return "\n---\n".join(parcalar)
+    for idx in sirali[:3]:
+        m = veri["metadatas"][idx]
+        parcalar.append(f"[{m['cve']} | {m.get('cwe_names', m['cwes'])} | np.dot={skor[idx]:.3f}]\n{veri['documents'][idx][:600]}")
 
-def norag(kod):
-    return sor(f"Analyze this Python function for security weaknesses.\n{FORMAT}\n\n{kod}")
+    tanimlar = "\n".join(f"- {c}: {cwe_aciklama.get(c, '')}" for c in adaylar if c in cwe_aciklama)
+    return "\n---\n".join(parcalar), tanimlar, knn[:3], adaylar[:3]
 
-def rag_cwe(kod, ozet):
-    return sor(f"""Reference weakness types (may or may not be relevant):
-{cwe_baglam(ozet)}
 
-Analyze this Python function for security weaknesses. Never mention a reference item that does not apply.
-{FORMAT}
+TOP3 = "Give your 3 best guesses for the CWE, most likely first, one per line as CWE-<number>. Output only those 3 lines."
 
-{kod}""")
 
-def rag_kod(kod, ozet):
-    return sor(f"""Similar known vulnerable functions from real CVEs (similar looking code does NOT guarantee the same weakness):
-{ornek_baglam(kod)}
+def cwe_norag(kod):
+    return sor(f"This Python function contains a security weakness.\n{TOP3}\n\n{kod[:2500]}")
 
-Reference weakness types (may or may not be relevant):
-{cwe_baglam(ozet)}
 
-Analyze this Python function for security weaknesses. Never mention a reference item that does not apply.
-{FORMAT}
+def cwe_rag_kod(kod, ctx, tanimlar, adaylar):
+    return sor(f"Top 3 similar vulnerable functions from vector DB (np.dot):\n{ctx}\n\n"
+               f"Candidate CWE definitions:\n{tanimlar}\n\n"
+               f"Analyze the Python function below using the similar examples above (primary candidate: {adaylar[0]}).\n{TOP3}\n\n{kod[:2500]}")
 
-{kod}""")
 
-def tahmin(cevap):
-    return sorted({m.upper() for m in re.findall(r"^[^A-Za-z]*(CWE-\d+)", cevap, re.M | re.I)})
+def cwe_liste(c, yedek=None):
+    g = []
+    for x in re.findall(r"CWE-\d+", c, re.I):
+        if x.upper() not in g:
+            g.append(x.upper())
+    if yedek:
+        for y in yedek:
+            if y not in g:
+                g.append(y)
+    return g[:3]
 
-kayitlar = [k for k in json.load(open("eval_python.json", encoding="utf-8")) if k["split"] == split][:n]
+
 bitenler = set()
 if os.path.exists(CIKTI):
-    bitenler = {json.loads(l)["id"] for l in open(CIKTI, encoding="utf-8")}
+    bitenler = {json.loads(l)["id"] for l in open(CIKTI, encoding="utf-8") if l.strip()}
 
 for i, k in enumerate(kayitlar, 1):
     if k["id"] in bitenler:
         continue
-    s = {"id": k["id"], "cve": k["cve"], "gercek": k["cwes"]}
-    for tur in ("vuln", "fixed"):
-        kod = k[tur]
-        ozet = ozetle(kod)
-        for ad, cevap in (("norag", norag(kod)), ("rag_cwe", rag_cwe(kod, ozet)), ("rag_kod", rag_kod(kod, ozet))):
-            s[f"{tur}_{ad}"] = tahmin(cevap)
-            s[f"{tur}_{ad}_ham"] = cevap
+    ctx, tanimlar, knn, adaylar = ornekler(k["vuln"])
+    s = {
+        "id": k["id"],
+        "cve": k["cve"],
+        "gercek": k["cwes"],
+        "cwe_knn": knn,
+        "cwe_norag": cwe_liste(cwe_norag(k["vuln"])),
+        "cwe_rag_kod": cwe_liste(cwe_rag_kod(k["vuln"], ctx, tanimlar, adaylar), adaylar)
+    }
     with open(CIKTI, "a", encoding="utf-8") as f:
         f.write(json.dumps(s, ensure_ascii=False) + "\n")
-    print(f"{i}/{len(kayitlar)} {k['cve']} gerçek={k['cwes']} norag={s['vuln_norag']} cwe={s['vuln_rag_cwe']} kod={s['vuln_rag_kod']}", flush=True)
+    print(f"{i}/{len(kayitlar)} {k['cve']} gerçek={k['cwes']} norag={s['cwe_norag']} knn={s['cwe_knn']} rag_kod={s['cwe_rag_kod']}", flush=True)
