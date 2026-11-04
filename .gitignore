@@ -1,0 +1,4 @@
+cvefixes/
+__pycache__/
+*.zip
+*.db
